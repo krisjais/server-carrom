@@ -11,10 +11,26 @@ router.get('/', async (req, res) => {
     const { matchType } = req.query;
     const filter = matchType ? { matchType } : {};
     const matches = await Match.find(filter)
-      .populate({ path: 'teamA', populate: { path: 'players' } })
-      .populate({ path: 'teamB', populate: { path: 'players' } })
+      .populate('teamA')
+      .populate('teamB')
+      .populate('winner')
       .sort({ round: 1, bracketPosition: 1 });
-    res.json(matches);
+
+    // Manually populate team players for doubles/mixed
+    const populated = await Promise.all(matches.map(async (match) => {
+      const m = match.toObject();
+      if (m.teamAModel === 'Team' && m.teamA) {
+        const team = await Team.findById(m.teamA._id || m.teamA).populate('players');
+        m.teamA = team;
+      }
+      if (m.teamBModel === 'Team' && m.teamB) {
+        const team = await Team.findById(m.teamB._id || m.teamB).populate('players');
+        m.teamB = team;
+      }
+      return m;
+    }));
+
+    res.json(populated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -57,8 +73,7 @@ router.put('/:id/result', async (req, res) => {
       req.params.id,
       { scoreA, scoreB, winner, status },
       { new: true }
-    ).populate({ path: 'teamA', populate: { path: 'players' } })
-     .populate({ path: 'teamB', populate: { path: 'players' } });
+    ).populate('teamA').populate('teamB');
 
     if (!match) return res.status(404).json({ error: 'Match not found' });
     res.json(match);
