@@ -1,14 +1,48 @@
 const express = require('express');
 const router = express.Router();
 const Player = require('../models/Player');
+const Team   = require('../models/Team');
+const Match  = require('../models/Match');
 
-// GET all players
+// GET all players (with eligibility info)
 router.get('/', async (req, res) => {
   try {
     const { gender } = req.query;
     const filter = gender ? { gender } : {};
     const players = await Player.find(filter).sort({ createdAt: 1 });
-    res.json(players);
+
+    // Check eligibility: has player participated in all 3 categories?
+    const allTeams   = await Team.find();
+    const allMatches = await Match.find({ matchType: { $in: ['single', 'double', 'mixed'] } });
+
+    const enriched = players.map(player => {
+      const pid = player._id.toString();
+      const cats = new Set();
+
+      // Singles
+      const inSingle = allMatches.some(m =>
+        m.matchType === 'single' && (
+          m.teamA?.toString() === pid || m.teamB?.toString() === pid
+        )
+      );
+      if (inSingle) cats.add('single');
+
+      // Doubles / Mixed via teams
+      const myTeams = allTeams.filter(t => t.players?.some(p => p.toString() === pid));
+      myTeams.forEach(t => {
+        if (t.matchType === 'double') cats.add('double');
+        if (t.matchType === 'mixed')  cats.add('mixed');
+      });
+
+      return {
+        ...player.toObject(),
+        categories:  [...cats],
+        playedAll3:  cats.size >= 3,
+        eligible:    cats.size < 3,
+      };
+    });
+
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
