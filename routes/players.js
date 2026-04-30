@@ -1,14 +1,62 @@
 const express = require('express');
-const router = express.Router();
-const Player = require('../models/Player');
+const router  = express.Router();
+const Player  = require('../models/Player');
+const Team    = require('../models/Team');
+const Match   = require('../models/Match');
 
-// GET all players
+// Helper: get match count + categories for a player
+async function getPlayerStats(playerId) {
+  const pid = playerId.toString();
+
+  // Singles matches
+  const singleMatches = await Match.find({
+    matchType: 'single',
+    $or: [{ teamA: pid }, { teamB: pid }],
+  });
+
+  // Teams this player is in
+  const myTeams = await Team.find({ players: pid });
+  const teamIds = myTeams.map(t => t._id.toString());
+
+  // Doubles matches via teams
+  const doubleMatches = await Match.find({
+    matchType: 'double',
+    $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }],
+  });
+
+  // Mixed matches via teams
+  const mixedMatches = await Match.find({
+    matchType: 'mixed',
+    $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }],
+  });
+
+  const categories = [];
+  if (singleMatches.length > 0) categories.push('single');
+  if (doubleMatches.length > 0) categories.push('double');
+  if (mixedMatches.length > 0)  categories.push('mixed');
+
+  const totalMatches = singleMatches.length + doubleMatches.length + mixedMatches.length;
+
+  return {
+    categories,
+    totalMatches,
+    eligible: totalMatches < 3,
+  };
+}
+
+// GET all players (with eligibility)
 router.get('/', async (req, res) => {
   try {
     const { gender } = req.query;
-    const filter = gender ? { gender } : {};
+    const filter  = gender ? { gender } : {};
     const players = await Player.find(filter).sort({ createdAt: 1 });
-    res.json(players);
+
+    const enriched = await Promise.all(players.map(async p => {
+      const stats = await getPlayerStats(p._id);
+      return { ...p.toObject(), ...stats };
+    }));
+
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

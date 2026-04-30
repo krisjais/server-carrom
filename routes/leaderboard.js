@@ -146,8 +146,9 @@ router.get('/players', async (req, res) => {
 async function getSinglesLeaderboard() {
   const players = await Player.find().sort({ name: 1 });
   const matches = await Match.find({ matchType: 'single' });
+  const allTeams = await Team.find();
 
-  const stats = players.map(player => {
+  const stats = await Promise.all(players.map(async player => {
     const pid = player._id.toString();
     const all = matches.filter(m =>
       (m.teamA && m.teamA.toString() === pid) ||
@@ -160,9 +161,24 @@ async function getSinglesLeaderboard() {
       s + (m.teamA?.toString() === pid ? (m.scoreA || 0) : (m.scoreB || 0)), 0);
     const winRate = done.length > 0 ? ((wins / done.length) * 100).toFixed(1) : '0.0';
 
-    return { _id: player._id, name: player.name, gender: player.gender,
-      matchesPlayed: done.length, wins, losses, totalPoints: pts, winRate };
-  });
+    // Categories played
+    const myTeams  = allTeams.filter(t => t.players?.some(p => p.toString() === pid));
+    const teamIds  = myTeams.map(t => t._id.toString());
+    const allMatchesForPlayer = await Match.find({
+      $or: [
+        { matchType: 'single', $or: [{ teamA: pid }, { teamB: pid }] },
+        { matchType: { $in: ['double', 'mixed'] }, $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }] },
+      ],
+    });
+    const categories = [...new Set(allMatchesForPlayer.map(m => m.matchType))];
+    const totalMatchCount = allMatchesForPlayer.length;
+
+    return {
+      _id: player._id, name: player.name, gender: player.gender,
+      matchesPlayed: done.length, wins, losses, totalPoints: pts, winRate,
+      categories, totalMatchCount, eligible: totalMatchCount < 3,
+    };
+  }));
 
   const sorted = stats.sort((a, b) =>
     b.wins - a.wins || parseFloat(b.winRate) - parseFloat(a.winRate) ||

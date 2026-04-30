@@ -41,8 +41,26 @@ function createBracket(participants, matchType, genderGroup, entityModel) {
 }
 
 async function generateSingleMatches() {
-  const males   = await Player.find({ gender: 'male' });
-  const females = await Player.find({ gender: 'female' });
+  const allMales   = await Player.find({ gender: 'male' });
+  const allFemales = await Player.find({ gender: 'female' });
+
+  // Filter out ineligible players (3+ matches played)
+  const eligible = async (players) => {
+    const result = [];
+    for (const p of players) {
+      const pid     = p._id.toString();
+      const myTeams = await Team.find({ players: pid });
+      const teamIds = myTeams.map(t => t._id.toString());
+      const singles = await Match.countDocuments({ matchType: 'single', $or: [{ teamA: pid }, { teamB: pid }] });
+      const doubles = await Match.countDocuments({ matchType: 'double', $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }] });
+      const mixed   = await Match.countDocuments({ matchType: 'mixed',  $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }] });
+      if (singles + doubles + mixed < 3) result.push(p);
+    }
+    return result;
+  };
+
+  const males   = await eligible(allMales);
+  const females = await eligible(allFemales);
 
   const maleMatches   = createBracket(males,   'single', 'male',   'Player');
   const femaleMatches = createBracket(females, 'single', 'female', 'Player');
