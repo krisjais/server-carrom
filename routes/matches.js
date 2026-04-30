@@ -73,10 +73,14 @@ router.post('/generate', async (req, res) => {
 // ── PUT set match live + toss ────────────────────────
 router.put('/:id/live', async (req, res) => {
   try {
-    const { firstStrike } = req.body; // 'A' or 'B'
+    const { firstStrike } = req.body;
     const match = await Match.findByIdAndUpdate(
       req.params.id,
-      { status: 'live', firstStrike: firstStrike || 'A' },
+      {
+        status: 'live',
+        firstStrike: firstStrike || 'A',
+        startedAt: new Date(), // ← record when match went live
+      },
       { new: true }
     );
     if (!match) return res.status(404).json({ error: 'Match not found' });

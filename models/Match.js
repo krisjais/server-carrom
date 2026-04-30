@@ -40,6 +40,8 @@ const matchSchema = new mongoose.Schema({
 
   // ICF: who strikes first (toss winner)
   firstStrike: { type: String, enum: ['A', 'B', null], default: null },
+  // Timer: when match went live
+  startedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Match', matchSchema);
