@@ -4,14 +4,14 @@ const Match   = require('../models/Match');
 const Team    = require('../models/Team');
 const { generateSingleMatches, generateDoubleMatches, generateMixedMatches } = require('../utils/matchGenerator');
 
-// ── ICF Rules Constants ──────────────────────────────
+// ── Scoring Rules ────────────────────────────────────
 const ICF = {
-  WIN_POINTS:  25,   // first to 25 points wins the match
-  WIN_BOARDS:  8,    // or first to win 8 boards
-  QUEEN_PTS:   3,    // queen = 3 points if covered
-  COIN_PTS:    1,    // each opponent coin left = 1 point
-  FOUL_PENALTY: 1,   // foul = return 1 coin (deduct 1 point from scorer)
-  TOTAL_COINS: 19,   // 9 white + 9 black + 1 queen
+  WIN_POINTS:   25,   // first to 25 points wins the match
+  WIN_BOARDS:   8,    // or first to win 8 boards
+  COIN_PTS:     10,   // each opponent coin left = 10 points
+  QUEEN_PTS:    50,   // queen covered = 50 points
+  FOUL_PENALTY: 10,   // foul = -10 points (1 coin worth)
+  TIME_BONUS:   20,   // 20 points per remaining minute when board ends
 };
 
 // Helper: check if match is won under ICF rules
@@ -90,10 +90,11 @@ router.put('/:id/live', async (req, res) => {
   }
 });
 
-// ── PUT submit board result (ICF scoring) ───────────
-// Body: { coinsLeftA, coinsLeftB, queenCoveredBy, foulsA, foulsB }
-// coinsLeftA = opponent A's coins still on board (scored by B)
-// coinsLeftB = opponent B's coins still on board (scored by A)
+// ── PUT submit board result (scoring) ───────────────
+// Body: { coinsLeftA, coinsLeftB, queenCoveredBy, foulsA, foulsB, remainingSeconds }
+// coinsLeftA = A's coins still on board (scored by B)
+// coinsLeftB = B's coins still on board (scored by A)
+// remainingSeconds = seconds left on the timer when board ended
 router.put('/:id/board', async (req, res) => {
   try {
     const match = await Match.findById(req.params.id);
@@ -101,29 +102,37 @@ router.put('/:id/board', async (req, res) => {
     if (match.status !== 'live') return res.status(400).json({ error: 'Match is not live' });
 
     const {
-      coinsLeftA = 0,   // A's coins left on board (B scores these)
-      coinsLeftB = 0,   // B's coins left on board (A scores these)
-      queenCoveredBy = null,  // 'A', 'B', or null
-      foulsA = 0,
-      foulsB = 0,
+      coinsLeftA       = 0,
+      coinsLeftB       = 0,
+      queenCoveredBy   = null,
+      foulsA           = 0,
+      foulsB           = 0,
+      remainingSeconds = 0,  // seconds left on timer
     } = req.body;
 
-    // ICF Scoring for this board:
-    // A scores: B's remaining coins + queen (if A covered) - A's foul penalties
+    // ── Scoring ──────────────────────────────────────
+    // Each coin = 10 pts, Queen = 50 pts, Foul = -10 pts
+    // Time bonus: 20 pts per remaining FULL minute (winner only)
+    const remainingMins = Math.floor(remainingSeconds / 60);
+
     let boardScoreA = coinsLeftB * ICF.COIN_PTS;
     let boardScoreB = coinsLeftA * ICF.COIN_PTS;
 
     if (queenCoveredBy === 'A') boardScoreA += ICF.QUEEN_PTS;
     if (queenCoveredBy === 'B') boardScoreB += ICF.QUEEN_PTS;
 
-    // Foul penalties: each foul = return 1 coin = -1 point
+    // Foul penalties
     boardScoreA = Math.max(0, boardScoreA - foulsA * ICF.FOUL_PENALTY);
     boardScoreB = Math.max(0, boardScoreB - foulsB * ICF.FOUL_PENALTY);
 
-    // Determine board winner
+    // Time bonus goes to the board winner
+    const boardWinnerRaw = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
+    if (boardWinnerRaw === 'A') boardScoreA += remainingMins * ICF.TIME_BONUS;
+    if (boardWinnerRaw === 'B') boardScoreB += remainingMins * ICF.TIME_BONUS;
+
     const boardWinner = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
 
-    // Record this board
+    // Record board
     const boardNumber = match.boards.length + 1;
     match.boards.push({
       boardNumber,
@@ -135,23 +144,20 @@ router.put('/:id/board', async (req, res) => {
       boardWinner,
     });
 
-    // Update cumulative match scores
     match.scoreA += boardScoreA;
     match.scoreB += boardScoreB;
     if (boardWinner === 'A') match.boardsWonA += 1;
     if (boardWinner === 'B') match.boardsWonB += 1;
 
-    // Check ICF win condition
+    // Check win condition
     const matchWinner = checkMatchWinner(match);
     if (matchWinner) {
-      match.status = 'completed';
+      match.status      = 'completed';
       match.winner      = matchWinner === 'A' ? match.teamA : match.teamB;
       match.winnerModel = matchWinner === 'A' ? match.teamAModel : match.teamBModel;
     }
 
     await match.save();
-
-    // Populate and return
     await match.populate('teamA');
     await match.populate('teamB');
     res.json(match);
