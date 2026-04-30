@@ -112,8 +112,9 @@ router.put('/:id/board', async (req, res) => {
 
     // ── Scoring ──────────────────────────────────────
     // Each coin = 10 pts, Queen = 50 pts, Foul = -10 pts
-    // Time bonus: 20 pts per remaining FULL minute (winner only)
-    const remainingMins = Math.floor(remainingSeconds / 60);
+    // Time bonus: 20 pts per minute remaining (proportional for partial minutes)
+    // Formula: (remainingSeconds / 60) * 20  — rounded to nearest integer
+    const timeBonus = Math.round((remainingSeconds / 60) * ICF.TIME_BONUS);
 
     let boardScoreA = coinsLeftB * ICF.COIN_PTS;
     let boardScoreB = coinsLeftA * ICF.COIN_PTS;
@@ -127,8 +128,8 @@ router.put('/:id/board', async (req, res) => {
 
     // Time bonus goes to the board winner
     const boardWinnerRaw = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
-    if (boardWinnerRaw === 'A') boardScoreA += remainingMins * ICF.TIME_BONUS;
-    if (boardWinnerRaw === 'B') boardScoreB += remainingMins * ICF.TIME_BONUS;
+    if (boardWinnerRaw === 'A') boardScoreA += timeBonus;
+    if (boardWinnerRaw === 'B') boardScoreB += timeBonus;
 
     const boardWinner = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
 
