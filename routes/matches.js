@@ -91,10 +91,9 @@ router.put('/:id/live', async (req, res) => {
 });
 
 // ── PUT submit board result (scoring) ───────────────
-// Body: { coinsLeftA, coinsLeftB, queenCoveredBy, foulsA, foulsB, remainingSeconds }
-// coinsLeftA = A's coins still on board (scored by B)
-// coinsLeftB = B's coins still on board (scored by A)
-// remainingSeconds = seconds left on the timer when board ended
+// Body: { coinsPocketedA, coinsPocketedB, queenCoveredBy, foulsA, foulsB, remainingSeconds }
+// coinsPocketedA = coins pocketed BY player A this board
+// coinsPocketedB = coins pocketed BY player B this board
 router.put('/:id/board', async (req, res) => {
   try {
     const match = await Match.findById(req.params.id);
@@ -102,22 +101,23 @@ router.put('/:id/board', async (req, res) => {
     if (match.status !== 'live') return res.status(400).json({ error: 'Match is not live' });
 
     const {
-      coinsLeftA       = 0,
-      coinsLeftB       = 0,
+      coinsPocketedA   = 0,   // coins pocketed BY A
+      coinsPocketedB   = 0,   // coins pocketed BY B
       queenCoveredBy   = null,
       foulsA           = 0,
       foulsB           = 0,
-      remainingSeconds = 0,  // seconds left on timer
+      remainingSeconds = 0,
     } = req.body;
 
     // ── Scoring ──────────────────────────────────────
-    // Each coin = 10 pts, Queen = 50 pts, Foul = -10 pts
-    // Time bonus: 20 pts per minute remaining (proportional for partial minutes)
-    // Formula: (remainingSeconds / 60) * 20  — rounded to nearest integer
+    // Each coin pocketed BY the player = 10 pts
+    // Queen covered BY the player = 50 pts
+    // Each foul = -10 pts
+    // Time bonus = (remainingSeconds / 60) * 20 pts → winner only
     const timeBonus = Math.round((remainingSeconds / 60) * ICF.TIME_BONUS);
 
-    let boardScoreA = coinsLeftB * ICF.COIN_PTS;
-    let boardScoreB = coinsLeftA * ICF.COIN_PTS;
+    let boardScoreA = coinsPocketedA * ICF.COIN_PTS;
+    let boardScoreB = coinsPocketedB * ICF.COIN_PTS;
 
     if (queenCoveredBy === 'A') boardScoreA += ICF.QUEEN_PTS;
     if (queenCoveredBy === 'B') boardScoreB += ICF.QUEEN_PTS;
@@ -126,14 +126,13 @@ router.put('/:id/board', async (req, res) => {
     boardScoreA = Math.max(0, boardScoreA - foulsA * ICF.FOUL_PENALTY);
     boardScoreB = Math.max(0, boardScoreB - foulsB * ICF.FOUL_PENALTY);
 
-    // Time bonus goes to the board winner
+    // Time bonus to board winner
     const boardWinnerRaw = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
     if (boardWinnerRaw === 'A') boardScoreA += timeBonus;
     if (boardWinnerRaw === 'B') boardScoreB += timeBonus;
 
     const boardWinner = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
 
-    // Record board
     const boardNumber = match.boards.length + 1;
     match.boards.push({
       boardNumber,
@@ -150,7 +149,6 @@ router.put('/:id/board', async (req, res) => {
     if (boardWinner === 'A') match.boardsWonA += 1;
     if (boardWinner === 'B') match.boardsWonB += 1;
 
-    // Check win condition
     const matchWinner = checkMatchWinner(match);
     if (matchWinner) {
       match.status      = 'completed';
