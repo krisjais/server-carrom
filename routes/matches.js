@@ -268,10 +268,19 @@ router.post('/advance', async (req, res) => {
           return res.status(409).json({
             conflict: true,
             message: `Common player conflict detected: ${commonPlayers.map(p => p.name).join(', ')} is in both 1st and 2nd place teams.`,
-            commonPlayers: commonPlayers.map(p => ({ _id: p._id, name: p.name, gender: p.gender })),
-            rank1Team: { id: rank1.id, players: rank1.players },
-            rank2Team: { id: rank2.id, players: rank2.players },
-            rank3Team: rank3Team ? { id: rank3Team._id, players: rank3Team.players } : null,
+            commonPlayers: commonPlayers.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
+            rank1Team: {
+              id: rank1.id.toString(),
+              players: rank1.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
+            },
+            rank2Team: {
+              id: rank2.id.toString(),
+              players: rank2.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
+            },
+            rank3Team: rank3Team ? {
+              id: rank3Team._id.toString(),
+              players: rank3Team.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
+            } : null,
             round,
             matchType,
           });
