@@ -62,24 +62,16 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Check if either player is already in a team for this matchType
-    // NOTE: A player CAN be in multiple teams (reshuffling is allowed)
-    // We only block if they are already in a team AND that team has played matches
-    const existingTeam = await Team.findOne({ matchType, players: { $in: playerIds } });
+    // Check if this exact pair already exists as a team (prevent duplicate teams)
+    const existingTeam = await Team.findOne({
+      matchType,
+      $and: [
+        { players: playerIds[0] },
+        { players: playerIds[1] },
+      ],
+    });
     if (existingTeam) {
-      // Check if this team has already played any matches
-      const teamMatchCount = await Match.countDocuments({
-        matchType,
-        $or: [{ teamA: existingTeam._id }, { teamB: existingTeam._id }],
-      });
-      if (teamMatchCount > 0) {
-        const player = await Player.findById(
-          playerIds.find(id => existingTeam.players.map(p => p.toString()).includes(id.toString()))
-        );
-        return res.status(400).json({
-          error: `${player?.name || 'A player'} is already in an active team for this category. Use the reshuffle feature to swap players.`,
-        });
-      }
+      return res.status(400).json({ error: 'This exact team pairing already exists for this category' });
     }
 
     const team = await Team.create({ players: playerIds, matchType });
