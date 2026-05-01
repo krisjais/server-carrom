@@ -2,45 +2,92 @@ const express = require('express');
 const router  = express.Router();
 const Match   = require('../models/Match');
 const Team    = require('../models/Team');
-const { generateSingleMatches, generateDoubleMatches, generateMixedMatches } = require('../utils/matchGenerator');
+const {
+  generateSingleMatches,
+  generateDoubleMatches,
+  generateMixedMatches,
+} = require('../utils/matchGenerator');
 
-// ── Scoring Rules ────────────────────────────────────
-const ICF = {
-  WIN_POINTS:   25,   // first to 25 points wins the match
-  WIN_BOARDS:   8,    // or first to win 8 boards
-  COIN_PTS:     10,   // each opponent coin left = 10 points
-  QUEEN_PTS:    50,   // queen covered = 50 points
-  FOUL_PENALTY: 10,   // foul = -10 points (1 coin worth)
-  TIME_BONUS:   20,   // 20 points per remaining minute when board ends
+// ─────────────────────────────────────────────────────
+// Scoring constants
+// ─────────────────────────────────────────────────────
+const SCORING = {
+  COIN_PTS:     10,   // points per coin pocketed by a player
+  QUEEN_PTS:    50,   // bonus for covering the queen
+  FOUL_PENALTY: 10,   // deducted per foul committed
+  TIME_BONUS:   20,   // bonus points per whole remaining minute (winner only)
 };
 
-// Helper: check if match is won under ICF rules
+// Win conditions (board-based — points are for ranking only)
+const WIN_BOARDS = 8;   // first to win 8 boards wins the match
+
+// ─────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────
+
+/**
+ * Calculate the score for one side in a single board.
+ * Returns the raw score (before time bonus).
+ */
+function calcBoardScore(coinsPocketed, queenCoveredBy, side, fouls) {
+  let score = coinsPocketed * SCORING.COIN_PTS;
+  if (queenCoveredBy === side) score += SCORING.QUEEN_PTS;
+  score -= fouls * SCORING.FOUL_PENALTY;
+  return Math.max(0, score);
+}
+
+/**
+ * Determine the board winner and apply the time bonus to that side.
+ * Returns { scoreA, scoreB, boardWinner }.
+ */
+function resolveBoardScores(rawA, rawB, remainingSeconds) {
+  // Time bonus: whole remaining minutes only (floor, not round)
+  const timeBonus = Math.floor(remainingSeconds / 60) * SCORING.TIME_BONUS;
+
+  // Determine winner from raw scores first
+  const preWinner = rawA > rawB ? 'A' : rawB > rawA ? 'B' : null;
+
+  // Apply time bonus to the winner
+  const scoreA = rawA + (preWinner === 'A' ? timeBonus : 0);
+  const scoreB = rawB + (preWinner === 'B' ? timeBonus : 0);
+
+  // Re-evaluate winner after bonus (should be same, but be safe)
+  const boardWinner = scoreA > scoreB ? 'A' : scoreB > scoreA ? 'B' : null;
+
+  return { scoreA, scoreB, boardWinner, timeBonus };
+}
+
+/**
+ * Check if the match has been won.
+ * A match is won by the first side to win WIN_BOARDS boards.
+ */
 function checkMatchWinner(match) {
-  if (match.scoreA >= ICF.WIN_POINTS || match.boardsWonA >= ICF.WIN_BOARDS) return 'A';
-  if (match.scoreB >= ICF.WIN_POINTS || match.boardsWonB >= ICF.WIN_BOARDS) return 'B';
+  if (match.boardsWonA >= WIN_BOARDS) return 'A';
+  if (match.boardsWonB >= WIN_BOARDS) return 'B';
   return null;
 }
 
-// ── GET matches ──────────────────────────────────────
+// ─────────────────────────────────────────────────────
+// GET /api/matches
+// ─────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const { matchType } = req.query;
-    const filter = matchType ? { matchType } : {};
+    const filter  = matchType ? { matchType } : {};
     const matches = await Match.find(filter)
       .populate('teamA')
       .populate('teamB')
       .populate('winner')
       .sort({ round: 1, bracketPosition: 1 });
 
+    // Populate nested team players for doubles/mixed
     const populated = await Promise.all(matches.map(async (match) => {
       const m = match.toObject();
       if (m.teamAModel === 'Team' && m.teamA) {
-        const team = await Team.findById(m.teamA._id || m.teamA).populate('players');
-        m.teamA = team;
+        m.teamA = await Team.findById(m.teamA._id || m.teamA).populate('players');
       }
       if (m.teamBModel === 'Team' && m.teamB) {
-        const team = await Team.findById(m.teamB._id || m.teamB).populate('players');
-        m.teamB = team;
+        m.teamB = await Team.findById(m.teamB._id || m.teamB).populate('players');
       }
       return m;
     }));
@@ -51,7 +98,9 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ── POST generate matches ────────────────────────────
+// ─────────────────────────────────────────────────────
+// POST /api/matches/generate
+// ─────────────────────────────────────────────────────
 router.post('/generate', async (req, res) => {
   try {
     const { matchType } = req.body;
@@ -59,7 +108,7 @@ router.post('/generate', async (req, res) => {
 
     await Match.deleteMany({ matchType });
 
-    if (matchType === 'single')      await generateSingleMatches();
+    if      (matchType === 'single') await generateSingleMatches();
     else if (matchType === 'double') await generateDoubleMatches();
     else if (matchType === 'mixed')  await generateMixedMatches();
     else return res.status(400).json({ error: 'Invalid matchType' });
@@ -70,16 +119,18 @@ router.post('/generate', async (req, res) => {
   }
 });
 
-// ── PUT set match live + toss ────────────────────────
+// ─────────────────────────────────────────────────────
+// PUT /api/matches/:id/live  — start match + record toss
+// ─────────────────────────────────────────────────────
 router.put('/:id/live', async (req, res) => {
   try {
     const { firstStrike } = req.body;
     const match = await Match.findByIdAndUpdate(
       req.params.id,
       {
-        status: 'live',
+        status:      'live',
         firstStrike: firstStrike || 'A',
-        startedAt: new Date(), // ← record when match went live
+        startedAt:   new Date(),
       },
       { new: true }
     );
@@ -90,65 +141,60 @@ router.put('/:id/live', async (req, res) => {
   }
 });
 
-// ── PUT submit board result (scoring) ───────────────
-// Body: { coinsPocketedA, coinsPocketedB, queenCoveredBy, foulsA, foulsB, remainingSeconds }
-// coinsPocketedA = coins pocketed BY player A this board
-// coinsPocketedB = coins pocketed BY player B this board
+// ─────────────────────────────────────────────────────
+// PUT /api/matches/:id/board  — submit one board result
+//
+// Body:
+//   coinsPocketedA   {number}  coins pocketed BY player/team A
+//   coinsPocketedB   {number}  coins pocketed BY player/team B
+//   queenCoveredBy   {'A'|'B'|null}
+//   foulsA           {number}
+//   foulsB           {number}
+//   remainingSeconds {number}  seconds left on the match clock when board ended
+// ─────────────────────────────────────────────────────
 router.put('/:id/board', async (req, res) => {
   try {
     const match = await Match.findById(req.params.id);
-    if (!match) return res.status(404).json({ error: 'Match not found' });
-    if (match.status !== 'live') return res.status(400).json({ error: 'Match is not live' });
+    if (!match)                    return res.status(404).json({ error: 'Match not found' });
+    if (match.status !== 'live')   return res.status(400).json({ error: 'Match is not live' });
 
     const {
-      coinsPocketedA   = 0,   // coins pocketed BY A
-      coinsPocketedB   = 0,   // coins pocketed BY B
+      coinsPocketedA   = 0,
+      coinsPocketedB   = 0,
       queenCoveredBy   = null,
       foulsA           = 0,
       foulsB           = 0,
       remainingSeconds = 0,
     } = req.body;
 
-    // ── Scoring ──────────────────────────────────────
-    // Each coin pocketed BY the player = 10 pts
-    // Queen covered BY the player = 50 pts
-    // Each foul = -10 pts
-    // Time bonus = (remainingSeconds / 60) * 20 pts → winner only
-    const timeBonus = Math.round((remainingSeconds / 60) * ICF.TIME_BONUS);
+    // 1. Raw scores (coins + queen − fouls)
+    const rawA = calcBoardScore(Number(coinsPocketedA), queenCoveredBy, 'A', Number(foulsA));
+    const rawB = calcBoardScore(Number(coinsPocketedB), queenCoveredBy, 'B', Number(foulsB));
 
-    let boardScoreA = coinsPocketedA * ICF.COIN_PTS;
-    let boardScoreB = coinsPocketedB * ICF.COIN_PTS;
+    // 2. Apply time bonus to board winner
+    const { scoreA, scoreB, boardWinner, timeBonus } = resolveBoardScores(
+      rawA, rawB, Number(remainingSeconds)
+    );
 
-    if (queenCoveredBy === 'A') boardScoreA += ICF.QUEEN_PTS;
-    if (queenCoveredBy === 'B') boardScoreB += ICF.QUEEN_PTS;
-
-    // Foul penalties
-    boardScoreA = Math.max(0, boardScoreA - foulsA * ICF.FOUL_PENALTY);
-    boardScoreB = Math.max(0, boardScoreB - foulsB * ICF.FOUL_PENALTY);
-
-    // Time bonus to board winner
-    const boardWinnerRaw = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
-    if (boardWinnerRaw === 'A') boardScoreA += timeBonus;
-    if (boardWinnerRaw === 'B') boardScoreB += timeBonus;
-
-    const boardWinner = boardScoreA > boardScoreB ? 'A' : boardScoreB > boardScoreA ? 'B' : null;
-
+    // 3. Record board
     const boardNumber = match.boards.length + 1;
     match.boards.push({
       boardNumber,
-      scoreA: boardScoreA,
-      scoreB: boardScoreB,
-      queenCoveredBy,
-      foulsA,
-      foulsB,
+      scoreA,
+      scoreB,
+      queenCoveredBy: queenCoveredBy || null,
+      foulsA: Number(foulsA),
+      foulsB: Number(foulsB),
       boardWinner,
     });
 
-    match.scoreA += boardScoreA;
-    match.scoreB += boardScoreB;
+    // 4. Accumulate match totals
+    match.scoreA    += scoreA;
+    match.scoreB    += scoreB;
     if (boardWinner === 'A') match.boardsWonA += 1;
     if (boardWinner === 'B') match.boardsWonB += 1;
 
+    // 5. Check match winner (boards-based)
     const matchWinner = checkMatchWinner(match);
     if (matchWinner) {
       match.status      = 'completed';
@@ -159,13 +205,28 @@ router.put('/:id/board', async (req, res) => {
     await match.save();
     await match.populate('teamA');
     await match.populate('teamB');
-    res.json(match);
+
+    res.json({
+      ...match.toObject(),
+      _debug: {
+        board: boardNumber,
+        rawA, rawB,
+        timeBonus,
+        scoreA, scoreB,
+        boardWinner,
+        boardsWonA: match.boardsWonA,
+        boardsWonB: match.boardsWonB,
+        matchWinner: matchWinner || 'ongoing',
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── PUT update match result (simple — admin override) ─
+// ─────────────────────────────────────────────────────
+// PUT /api/matches/:id/result  — admin manual override
+// ─────────────────────────────────────────────────────
 router.put('/:id/result', async (req, res) => {
   try {
     const { scoreA, scoreB, winner, status } = req.body;
@@ -173,36 +234,29 @@ router.put('/:id/result', async (req, res) => {
     const match = await Match.findById(req.params.id);
     if (!match) return res.status(404).json({ error: 'Match not found' });
 
-    if (scoreA !== undefined) match.scoreA = scoreA;
-    if (scoreB !== undefined) match.scoreB = scoreB;
-    if (status)  match.status = status;
+    if (scoreA !== undefined) match.scoreA = Number(scoreA);
+    if (scoreB !== undefined) match.scoreB = Number(scoreB);
+    if (status)               match.status = status;
 
     if (winner) {
-      match.winner = winner;
-      match.winnerModel = match.teamAModel; // will be corrected below
-      // Determine winnerModel from which team matches
-      if (match.teamA && match.teamA.toString() === winner.toString()) {
-        match.winnerModel = match.teamAModel;
-      } else {
-        match.winnerModel = match.teamBModel;
-      }
+      match.winner      = winner;
+      match.winnerModel = (match.teamA && match.teamA.toString() === winner.toString())
+        ? match.teamAModel
+        : match.teamBModel;
     }
 
-    // Auto-determine winner from ICF rules if status = completed
+    // Auto-determine winner when marking completed without explicit winner
     if (status === 'completed' && !winner) {
       const w = checkMatchWinner(match);
       if (w) {
         match.winner      = w === 'A' ? match.teamA : match.teamB;
         match.winnerModel = w === 'A' ? match.teamAModel : match.teamBModel;
-      } else {
-        // Fallback: higher score wins
-        if (match.scoreA > match.scoreB) {
-          match.winner      = match.teamA;
-          match.winnerModel = match.teamAModel;
-        } else if (match.scoreB > match.scoreA) {
-          match.winner      = match.teamB;
-          match.winnerModel = match.teamBModel;
-        }
+      } else if (match.scoreA > match.scoreB) {
+        match.winner      = match.teamA;
+        match.winnerModel = match.teamAModel;
+      } else if (match.scoreB > match.scoreA) {
+        match.winner      = match.teamB;
+        match.winnerModel = match.teamBModel;
       }
     }
 
@@ -215,7 +269,9 @@ router.put('/:id/result', async (req, res) => {
   }
 });
 
-// ── POST advance winners ─────────────────────────────
+// ─────────────────────────────────────────────────────
+// POST /api/matches/advance  — advance round winners
+// ─────────────────────────────────────────────────────
 router.post('/advance', async (req, res) => {
   try {
     const { matchType, round } = req.body;
@@ -225,19 +281,20 @@ router.post('/advance', async (req, res) => {
       return res.status(400).json({ error: 'No completed matches in this round' });
     }
 
-    // Collect winners in order (rank 1, 2, 3...)
-    const winnerEntries = completedMatches
-      .filter(m => m.winner && !m.isBye)
-      .map(m => ({
-        id:    m.winner,
-        model: m.winner.equals(m.teamA) ? m.teamAModel : m.teamBModel,
-      }));
+    // Collect winners (non-bye matches first, then byes)
+    const winnerEntries = [
+      ...completedMatches
+        .filter(m => m.winner && !m.isBye)
+        .map(m => ({
+          id:    m.winner,
+          model: m.winner.equals(m.teamA) ? m.teamAModel : m.teamBModel,
+        })),
+      ...completedMatches
+        .filter(m => m.isBye && m.teamA)
+        .map(m => ({ id: m.teamA, model: m.teamAModel })),
+    ];
 
-    completedMatches.filter(m => m.isBye && m.teamA).forEach(m => {
-      winnerEntries.push({ id: m.teamA, model: m.teamAModel });
-    });
-
-    // ── Common player conflict detection (Doubles/Mixed only) ──
+    // Common player conflict detection (doubles/mixed only)
     if ((matchType === 'double' || matchType === 'mixed') && winnerEntries.length >= 2) {
       const populatedWinners = await Promise.all(
         winnerEntries.map(async (w, idx) => {
@@ -249,34 +306,31 @@ router.post('/advance', async (req, res) => {
         })
       );
 
-      // Check if any player appears in both rank-1 and rank-2 teams
       const rank1 = populatedWinners[0];
       const rank2 = populatedWinners[1];
 
-      if (rank1 && rank2 && rank1.players.length && rank2.players.length) {
-        const rank1Ids = rank1.players.map(p => p._id.toString());
+      if (rank1?.players.length && rank2?.players.length) {
+        const rank1Ids     = rank1.players.map(p => p._id.toString());
         const commonPlayers = rank2.players.filter(p => rank1Ids.includes(p._id.toString()));
 
         if (commonPlayers.length > 0) {
-          // There's a conflict — return conflict info instead of advancing
-          // Admin must resolve by choosing a replacement from rank-3 team
-          const rank3 = populatedWinners[2] || null;
+          const rank3     = populatedWinners[2] || null;
           const rank3Team = rank3 ? await Team.findById(rank3.id).populate('players') : null;
 
           return res.status(409).json({
             conflict: true,
-            message: `Common player conflict detected: ${commonPlayers.map(p => p.name).join(', ')} is in both 1st and 2nd place teams.`,
+            message: `Common player conflict: ${commonPlayers.map(p => p.name).join(', ')} appears in both 1st and 2nd place teams.`,
             commonPlayers: commonPlayers.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
             rank1Team: {
-              id: rank1.id.toString(),
+              id:      rank1.id.toString(),
               players: rank1.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
             },
             rank2Team: {
-              id: rank2.id.toString(),
+              id:      rank2.id.toString(),
               players: rank2.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
             },
             rank3Team: rank3Team ? {
-              id: rank3Team._id.toString(),
+              id:      rank3Team._id.toString(),
               players: rank3Team.players.map(p => ({ _id: p._id.toString(), name: p.name, gender: p.gender })),
             } : null,
             round,
@@ -286,13 +340,13 @@ router.post('/advance', async (req, res) => {
       }
     }
 
-    // No conflict — proceed normally
+    // No conflict — create next round
     const nextRound  = round + 1;
     const newMatches = [];
 
     for (let i = 0; i < winnerEntries.length; i += 2) {
-      const a    = winnerEntries[i];
-      const b    = winnerEntries[i + 1];
+      const a     = winnerEntries[i];
+      const b     = winnerEntries[i + 1];
       const isBye = !b;
 
       newMatches.push({
@@ -306,7 +360,7 @@ router.post('/advance', async (req, res) => {
         teamBModel: isBye ? null : b.model,
         isBye,
         status:      isBye ? 'completed' : 'upcoming',
-        winner:      isBye ? a.id : null,
+        winner:      isBye ? a.id  : null,
         winnerModel: isBye ? a.model : null,
       });
     }
@@ -318,11 +372,9 @@ router.post('/advance', async (req, res) => {
   }
 });
 
-// ── POST resolve common player conflict ──────────────
-// When rank-1 and rank-2 teams share a player:
-// - Common player stays with rank-1 team
-// - rank-2 team gets a replacement player from rank-3 team
-// Body: { matchType, round, rank2TeamId, removePlayerId, addPlayerId }
+// ─────────────────────────────────────────────────────
+// POST /api/matches/resolve-conflict
+// ─────────────────────────────────────────────────────
 router.post('/resolve-conflict', async (req, res) => {
   try {
     const { matchType, round, rank2TeamId, removePlayerId, addPlayerId } = req.body;
@@ -331,33 +383,30 @@ router.post('/resolve-conflict', async (req, res) => {
       return res.status(400).json({ error: 'rank2TeamId, removePlayerId, addPlayerId are required' });
     }
 
-    // Remove common player from rank-2 team, add replacement
-    await Team.findByIdAndUpdate(rank2TeamId, {
-      $pull: { players: removePlayerId },
-    });
-    await Team.findByIdAndUpdate(rank2TeamId, {
-      $push: { players: addPlayerId },
-    });
+    // Swap player in rank-2 team
+    await Team.findByIdAndUpdate(rank2TeamId, { $pull: { players: removePlayerId } });
+    await Team.findByIdAndUpdate(rank2TeamId, { $push: { players: addPlayerId } });
 
-    // Now advance winners normally
+    // Advance normally after conflict resolution
     const completedMatches = await Match.find({ matchType, round, status: 'completed' });
-    const winnerEntries = completedMatches
-      .filter(m => m.winner && !m.isBye)
-      .map(m => ({
-        id:    m.winner,
-        model: m.winner.equals(m.teamA) ? m.teamAModel : m.teamBModel,
-      }));
-
-    completedMatches.filter(m => m.isBye && m.teamA).forEach(m => {
-      winnerEntries.push({ id: m.teamA, model: m.teamAModel });
-    });
+    const winnerEntries = [
+      ...completedMatches
+        .filter(m => m.winner && !m.isBye)
+        .map(m => ({
+          id:    m.winner,
+          model: m.winner.equals(m.teamA) ? m.teamAModel : m.teamBModel,
+        })),
+      ...completedMatches
+        .filter(m => m.isBye && m.teamA)
+        .map(m => ({ id: m.teamA, model: m.teamAModel })),
+    ];
 
     const nextRound  = round + 1;
     const newMatches = [];
 
     for (let i = 0; i < winnerEntries.length; i += 2) {
-      const a    = winnerEntries[i];
-      const b    = winnerEntries[i + 1];
+      const a     = winnerEntries[i];
+      const b     = winnerEntries[i + 1];
       const isBye = !b;
 
       newMatches.push({
@@ -371,7 +420,7 @@ router.post('/resolve-conflict', async (req, res) => {
         teamBModel: isBye ? null : b.model,
         isBye,
         status:      isBye ? 'completed' : 'upcoming',
-        winner:      isBye ? a.id : null,
+        winner:      isBye ? a.id  : null,
         winnerModel: isBye ? a.model : null,
       });
     }
@@ -388,31 +437,30 @@ router.post('/resolve-conflict', async (req, res) => {
   }
 });
 
-// ── GET match rules summary ──────────────────────────
-router.get('/rules', (req, res) => {
+// ─────────────────────────────────────────────────────
+// GET /api/matches/rules
+// ─────────────────────────────────────────────────────
+router.get('/rules', (_req, res) => {
   res.json({
-    title: 'ICF Official Carrom Rules (Tournament Format)',
-    rules: [
-      { rule: 'Board & Equipment', detail: 'Board: 74×74 cm | Striker: 41–43 mm | Coins: 9 White, 9 Black, 1 Red Queen' },
-      { rule: 'Match Types',       detail: 'Singles: 1v1 | Doubles: 2v2' },
-      { rule: 'Objective',         detail: 'First to 25 points OR win 8 boards' },
-      { rule: 'Toss',              detail: 'Winner chooses first strike or color' },
-      { rule: 'Break Shot',        detail: 'Striker from baseline to break center' },
-      { rule: 'Turn Rules',        detail: 'Pocket a coin = continue | Miss = turn passes' },
-      { rule: 'Queen Rules',       detail: 'Pocket queen then cover on next shot. If not covered, queen returns to center' },
-      { rule: 'Fouls',             detail: 'Striker pocket, double hit, illegal touch → return 1 coin penalty' },
-      { rule: 'Scoring',           detail: 'Each opponent coin left = 1 pt | Queen covered = 3 pts | Foul = -1 pt' },
-      { rule: 'End of Board',      detail: 'All coins pocketed + queen covered' },
-      { rule: 'Doubles',           detail: 'Alternate turns, team penalties apply' },
-    ],
-    winConditions: {
-      points: ICF.WIN_POINTS,
-      boards: ICF.WIN_BOARDS,
+    title: 'Carrom Tournament Scoring Rules',
+    scoring: {
+      coinPocketed:  `${SCORING.COIN_PTS} pts per coin pocketed`,
+      queenCovered:  `${SCORING.QUEEN_PTS} pts for covering the queen`,
+      foulPenalty:   `−${SCORING.FOUL_PENALTY} pts per foul`,
+      timeBonus:     `+${SCORING.TIME_BONUS} pts per whole remaining minute (board winner only)`,
     },
+    winCondition: `First to win ${WIN_BOARDS} boards wins the match`,
+    notes: [
+      'Points accumulate across boards for ranking/tiebreaking purposes.',
+      'Time bonus uses floor(remainingSeconds / 60) — partial minutes do not count.',
+      'Board winner is determined from raw score (before time bonus) to avoid circular dependency.',
+    ],
   });
 });
 
-// ── DELETE clear matches ─────────────────────────────
+// ─────────────────────────────────────────────────────
+// DELETE /api/matches/clear
+// ─────────────────────────────────────────────────────
 router.delete('/clear', async (req, res) => {
   try {
     const { matchType } = req.query;

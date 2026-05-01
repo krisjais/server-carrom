@@ -4,13 +4,49 @@ const Match   = require('../models/Match');
 const Player  = require('../models/Player');
 const Team    = require('../models/Team');
 
-// ── GET /api/leaderboard?type=single|double|mixed|all ──
+// ─────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────
+
+/**
+ * Given a list of completed matches and an entity ID (player or team),
+ * return { played, wins, losses, points }.
+ * sideField: 'teamA' | 'teamB' — which field holds this entity's ID.
+ */
+function calcStats(completedMatches, entityId) {
+  const id = entityId.toString();
+
+  const relevant = completedMatches.filter(m =>
+    (m.teamA && m.teamA.toString() === id) ||
+    (m.teamB && m.teamB.toString() === id)
+  );
+
+  const wins   = relevant.filter(m => m.winner && m.winner.toString() === id).length;
+  const losses = relevant.length - wins;
+
+  const points = relevant.reduce((sum, m) => {
+    const isA = m.teamA && m.teamA.toString() === id;
+    return sum + (isA ? (m.scoreA || 0) : (m.scoreB || 0));
+  }, 0);
+
+  const winRate = relevant.length > 0
+    ? ((wins / relevant.length) * 100).toFixed(1)
+    : '0.0';
+
+  return { played: relevant.length, wins, losses, points, winRate };
+}
+
+// ─────────────────────────────────────────────────────
+// GET /api/leaderboard?type=single|double|mixed|all
+// ─────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const type = req.query.type || 'single';
-    if (type === 'single')  return res.json(await getSinglesLeaderboard());
-    if (type === 'double')  return res.json(await getTeamLeaderboard('double'));
-    if (type === 'mixed')   return res.json(await getTeamLeaderboard('mixed'));
+
+    if (type === 'single') return res.json(await getSinglesLeaderboard());
+    if (type === 'double') return res.json(await getTeamLeaderboard('double'));
+    if (type === 'mixed')  return res.json(await getTeamLeaderboard('mixed'));
+
     if (type === 'all') {
       const [singles, doubles, mixed] = await Promise.all([
         getSinglesLeaderboard(),
@@ -19,118 +55,108 @@ router.get('/', async (req, res) => {
       ]);
       return res.json({ singles, doubles, mixed });
     }
-    res.status(400).json({ error: 'Invalid type' });
+
+    res.status(400).json({ error: 'Invalid type. Use single | double | mixed | all' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/leaderboard/players — full player stats with categories ──
+// ─────────────────────────────────────────────────────
+// GET /api/leaderboard/players — full per-player stats
+// ─────────────────────────────────────────────────────
 router.get('/players', async (req, res) => {
   try {
-    const players     = await Player.find().sort({ name: 1 });
-    const allMatches  = await Match.find();
-    const allTeams    = await Team.find().populate('players');
+    const [players, allMatches, allTeams] = await Promise.all([
+      Player.find().sort({ name: 1 }),
+      Match.find({ status: 'completed' }),   // only completed matches count
+      Team.find().populate('players'),
+    ]);
 
-    const stats = await Promise.all(players.map(async player => {
+    const stats = players.map(player => {
       const pid = player._id.toString();
 
-      // ── Singles stats ──
+      // ── Singles ──────────────────────────────────
       const singleMatches = allMatches.filter(m =>
         m.matchType === 'single' && (
           (m.teamA && m.teamA.toString() === pid) ||
           (m.teamB && m.teamB.toString() === pid)
         )
       );
-      const singleDone  = singleMatches.filter(m => m.status === 'completed');
-      const singleWins  = singleDone.filter(m => m.winner && m.winner.toString() === pid).length;
-      const singlePts   = singleDone.reduce((s, m) =>
-        s + (m.teamA?.toString() === pid ? (m.scoreA || 0) : (m.scoreB || 0)), 0);
+      const singleStats = calcStats(singleMatches, pid);
 
-      // ── Doubles stats (via team) ──
+      // ── Doubles ──────────────────────────────────
       const doubleTeams = allTeams.filter(t =>
-        t.matchType === 'double' && t.players?.some(p => p._id.toString() === pid)
+        t.matchType === 'double' &&
+        t.players?.some(p => p._id.toString() === pid)
       );
       const doubleMatches = allMatches.filter(m =>
-        m.matchType === 'double' && doubleTeams.some(t =>
+        m.matchType === 'double' &&
+        doubleTeams.some(t =>
           (m.teamA && m.teamA.toString() === t._id.toString()) ||
           (m.teamB && m.teamB.toString() === t._id.toString())
         )
       );
-      const doubleDone = doubleMatches.filter(m => m.status === 'completed');
-      const doubleWins = doubleDone.filter(m => {
-        const winnerTeam = doubleTeams.find(t => t._id.toString() === m.winner?.toString());
-        return !!winnerTeam;
-      }).length;
-      const doublePts = doubleDone.reduce((s, m) => {
-        const myTeam = doubleTeams.find(t => t._id.toString() === m.teamA?.toString());
-        return s + (myTeam ? (m.scoreA || 0) : (m.scoreB || 0));
-      }, 0);
+      // For doubles, wins/points are attributed to the team, not the player directly
+      const doubleStats = doubleTeams.length > 0
+        ? calcStatsForTeams(doubleMatches, doubleTeams)
+        : { played: 0, wins: 0, losses: 0, points: 0, winRate: '0.0' };
 
-      // ── Mixed stats (via team) ──
+      // ── Mixed ─────────────────────────────────────
       const mixedTeams = allTeams.filter(t =>
-        t.matchType === 'mixed' && t.players?.some(p => p._id.toString() === pid)
+        t.matchType === 'mixed' &&
+        t.players?.some(p => p._id.toString() === pid)
       );
       const mixedMatches = allMatches.filter(m =>
-        m.matchType === 'mixed' && mixedTeams.some(t =>
+        m.matchType === 'mixed' &&
+        mixedTeams.some(t =>
           (m.teamA && m.teamA.toString() === t._id.toString()) ||
           (m.teamB && m.teamB.toString() === t._id.toString())
         )
       );
-      const mixedDone = mixedMatches.filter(m => m.status === 'completed');
-      const mixedWins = mixedDone.filter(m => {
-        const winnerTeam = mixedTeams.find(t => t._id.toString() === m.winner?.toString());
-        return !!winnerTeam;
-      }).length;
-      const mixedPts = mixedDone.reduce((s, m) => {
-        const myTeam = mixedTeams.find(t => t._id.toString() === m.teamA?.toString());
-        return s + (myTeam ? (m.scoreA || 0) : (m.scoreB || 0));
-      }, 0);
+      const mixedStats = mixedTeams.length > 0
+        ? calcStatsForTeams(mixedMatches, mixedTeams)
+        : { played: 0, wins: 0, losses: 0, points: 0, winRate: '0.0' };
 
-      // ── Categories played ──
-      const categories = [];
-      if (singleMatches.length > 0)  categories.push('single');
-      if (doubleMatches.length > 0)  categories.push('double');
-      if (mixedMatches.length > 0)   categories.push('mixed');
-
-      // ── Eligibility: played all 3 = ineligible for new matches ──
-      const playedAll3 = categories.length >= 3;
-
-      // ── Overall totals ──
-      const totalWins   = singleWins + doubleWins + mixedWins;
-      const totalPoints = singlePts  + doublePts  + mixedPts;
-      const totalPlayed = singleDone.length + doubleDone.length + mixedDone.length;
-      const totalLosses = totalPlayed - totalWins;
+      // ── Totals ────────────────────────────────────
+      const totalPlayed = singleStats.played + doubleStats.played + mixedStats.played;
+      const totalWins   = singleStats.wins   + doubleStats.wins   + mixedStats.wins;
+      const totalLosses = singleStats.losses + doubleStats.losses + mixedStats.losses;
+      const totalPoints = singleStats.points + doubleStats.points + mixedStats.points;
       const winRate     = totalPlayed > 0
         ? ((totalWins / totalPlayed) * 100).toFixed(1)
         : '0.0';
+
+      // Categories this player has participated in
+      const categories = [
+        singleMatches.length > 0 ? 'single' : null,
+        doubleMatches.length > 0 ? 'double' : null,
+        mixedMatches.length  > 0 ? 'mixed'  : null,
+      ].filter(Boolean);
 
       return {
         _id:    player._id,
         name:   player.name,
         gender: player.gender,
 
-        // Category breakdown
         categories,
-        playedAll3,
+        eligible: categories.length < 3,   // ineligible once played all 3
 
-        // Per-category stats
-        single: { played: singleDone.length, wins: singleWins, points: singlePts },
-        double: { played: doubleDone.length, wins: doubleWins, points: doublePts },
-        mixed:  { played: mixedDone.length,  wins: mixedWins,  points: mixedPts  },
+        single: singleStats,
+        double: doubleStats,
+        mixed:  mixedStats,
 
-        // Overall
         totalPlayed,
         totalWins,
         totalLosses,
         totalPoints,
         winRate,
       };
-    }));
+    });
 
-    // Sort by totalWins → winRate → totalPoints
+    // Sort: wins → winRate → points → name
     stats.sort((a, b) =>
-      b.totalWins - a.totalWins ||
+      b.totalWins   - a.totalWins   ||
       parseFloat(b.winRate) - parseFloat(a.winRate) ||
       b.totalPoints - a.totalPoints ||
       a.name.localeCompare(b.name)
@@ -142,47 +168,56 @@ router.get('/players', async (req, res) => {
   }
 });
 
-// ── Singles leaderboard ──────────────────────────────
+// ─────────────────────────────────────────────────────
+// Singles leaderboard (grouped by gender)
+// ─────────────────────────────────────────────────────
 async function getSinglesLeaderboard() {
-  const players = await Player.find().sort({ name: 1 });
-  const matches = await Match.find({ matchType: 'single' });
-  const allTeams = await Team.find();
+  const [players, allMatches, allTeams] = await Promise.all([
+    Player.find().sort({ name: 1 }),
+    Match.find({ matchType: 'single', status: 'completed' }),
+    Team.find(),
+  ]);
 
   const stats = await Promise.all(players.map(async player => {
     const pid = player._id.toString();
-    const all = matches.filter(m =>
-      (m.teamA && m.teamA.toString() === pid) ||
-      (m.teamB && m.teamB.toString() === pid)
-    );
-    const done   = all.filter(m => m.status === 'completed');
-    const wins   = done.filter(m => m.winner && m.winner.toString() === pid).length;
-    const losses = done.length - wins;
-    const pts    = done.reduce((s, m) =>
-      s + (m.teamA?.toString() === pid ? (m.scoreA || 0) : (m.scoreB || 0)), 0);
-    const winRate = done.length > 0 ? ((wins / done.length) * 100).toFixed(1) : '0.0';
 
-    // Categories played
+    const { played, wins, losses, points, winRate } = calcStats(allMatches, pid);
+
+    // Eligibility: count all match types this player has been in
     const myTeams  = allTeams.filter(t => t.players?.some(p => p.toString() === pid));
     const teamIds  = myTeams.map(t => t._id.toString());
-    const allMatchesForPlayer = await Match.find({
+    const allForPlayer = await Match.find({
       $or: [
         { matchType: 'single', $or: [{ teamA: pid }, { teamB: pid }] },
-        { matchType: { $in: ['double', 'mixed'] }, $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }] },
+        {
+          matchType: { $in: ['double', 'mixed'] },
+          $or: [{ teamA: { $in: teamIds } }, { teamB: { $in: teamIds } }],
+        },
       ],
     });
-    const categories = [...new Set(allMatchesForPlayer.map(m => m.matchType))];
-    const totalMatchCount = allMatchesForPlayer.length;
+    const categories      = [...new Set(allForPlayer.map(m => m.matchType))];
+    const totalMatchCount = allForPlayer.length;
 
     return {
-      _id: player._id, name: player.name, gender: player.gender,
-      matchesPlayed: done.length, wins, losses, totalPoints: pts, winRate,
-      categories, totalMatchCount, eligible: totalMatchCount < 3,
+      _id:    player._id,
+      name:   player.name,
+      gender: player.gender,
+      matchesPlayed: played,
+      wins,
+      losses,
+      totalPoints: points,
+      winRate,
+      categories,
+      totalMatchCount,
+      eligible: totalMatchCount < 3,
     };
   }));
 
   const sorted = stats.sort((a, b) =>
-    b.wins - a.wins || parseFloat(b.winRate) - parseFloat(a.winRate) ||
-    b.totalPoints - a.totalPoints || a.name.localeCompare(b.name)
+    b.wins   - a.wins   ||
+    parseFloat(b.winRate) - parseFloat(a.winRate) ||
+    b.totalPoints - a.totalPoints ||
+    a.name.localeCompare(b.name)
   );
 
   return {
@@ -191,40 +226,56 @@ async function getSinglesLeaderboard() {
   };
 }
 
-// ── Team leaderboard ─────────────────────────────────
+// ─────────────────────────────────────────────────────
+// Team leaderboard (doubles or mixed)
+// ─────────────────────────────────────────────────────
 async function getTeamLeaderboard(matchType) {
-  const teams   = await Team.find({ matchType }).populate('players');
-  const matches = await Match.find({ matchType });
+  const [teams, matches] = await Promise.all([
+    Team.find({ matchType }).populate('players'),
+    Match.find({ matchType, status: 'completed' }),
+  ]);
 
   const stats = teams.map(team => {
-    const tid  = team._id.toString();
-    const all  = matches.filter(m =>
-      (m.teamA && m.teamA.toString() === tid) ||
-      (m.teamB && m.teamB.toString() === tid)
-    );
-    const done   = all.filter(m => m.status === 'completed');
-    const wins   = done.filter(m => m.winner && m.winner.toString() === tid).length;
-    const losses = done.length - wins;
-    const pts    = done.reduce((s, m) =>
-      s + (m.teamA?.toString() === tid ? (m.scoreA || 0) : (m.scoreB || 0)), 0);
-    const winRate = done.length > 0 ? ((wins / done.length) * 100).toFixed(1) : '0.0';
+    const { played, wins, losses, points, winRate } = calcStats(matches, team._id);
 
     return {
-      _id: team._id,
-      name: team.players?.map(p => p.name).join(' & ') || 'Unknown',
-      players: team.players,
+      _id:           team._id,
+      name:          team.players?.map(p => p.name).join(' & ') || 'Unknown',
+      players:       team.players,
       matchType,
-      matchesPlayed: done.length,
-      wins, losses,
-      totalPoints: pts,
+      matchesPlayed: played,
+      wins,
+      losses,
+      totalPoints:   points,
       winRate,
     };
   });
 
   return stats.sort((a, b) =>
-    b.wins - a.wins || parseFloat(b.winRate) - parseFloat(a.winRate) ||
-    b.totalPoints - a.totalPoints || a.name.localeCompare(b.name)
+    b.wins   - a.wins   ||
+    parseFloat(b.winRate) - parseFloat(a.winRate) ||
+    b.totalPoints - a.totalPoints ||
+    a.name.localeCompare(b.name)
   );
+}
+
+// ─────────────────────────────────────────────────────
+// Helper: aggregate stats across multiple teams for one player
+// (used when a player is on a team in doubles/mixed)
+// ─────────────────────────────────────────────────────
+function calcStatsForTeams(completedMatches, teams) {
+  let played = 0, wins = 0, losses = 0, points = 0;
+
+  for (const team of teams) {
+    const s = calcStats(completedMatches, team._id);
+    played += s.played;
+    wins   += s.wins;
+    losses += s.losses;
+    points += s.points;
+  }
+
+  const winRate = played > 0 ? ((wins / played) * 100).toFixed(1) : '0.0';
+  return { played, wins, losses, points, winRate };
 }
 
 module.exports = router;
