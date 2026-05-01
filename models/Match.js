@@ -42,6 +42,8 @@ const matchSchema = new mongoose.Schema({
   firstStrike: { type: String, enum: ['A', 'B', null], default: null },
   // Timer: when match went live
   startedAt: { type: Date, default: null },
+  // Timer: when the current board started (resets after each board submission)
+  boardStartedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Match', matchSchema);

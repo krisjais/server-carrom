@@ -128,9 +128,10 @@ router.put('/:id/live', async (req, res) => {
     const match = await Match.findByIdAndUpdate(
       req.params.id,
       {
-        status:      'live',
-        firstStrike: firstStrike || 'A',
-        startedAt:   new Date(),
+        status:         'live',
+        firstStrike:    firstStrike || 'A',
+        startedAt:      new Date(),
+        boardStartedAt: new Date(),   // start the first board timer
       },
       { new: true }
     );
@@ -164,8 +165,14 @@ router.put('/:id/board', async (req, res) => {
       queenCoveredBy   = null,
       foulsA           = 0,
       foulsB           = 0,
-      remainingSeconds = 0,
     } = req.body;
+
+    // Compute remaining seconds from the board timer (server-side, authoritative)
+    const BOARD_DURATION = { single: 10 * 60, double: 15 * 60, mixed: 15 * 60 };
+    const boardTotal     = BOARD_DURATION[match.matchType] || 600;
+    const boardStarted   = match.boardStartedAt ? new Date(match.boardStartedAt).getTime() : Date.now();
+    const boardElapsed   = Math.floor((Date.now() - boardStarted) / 1000);
+    const remainingSeconds = Math.max(0, boardTotal - boardElapsed);
 
     // 1. Raw scores (coins + queen − fouls)
     const rawA = calcBoardScore(Number(coinsPocketedA), queenCoveredBy, 'A', Number(foulsA));
@@ -173,9 +180,8 @@ router.put('/:id/board', async (req, res) => {
 
     // 2. Apply time bonus to board winner
     const { scoreA, scoreB, boardWinner, timeBonus } = resolveBoardScores(
-      rawA, rawB, Number(remainingSeconds)
+      rawA, rawB, remainingSeconds
     );
-
     // 3. Record board
     const boardNumber = match.boards.length + 1;
     match.boards.push({
@@ -200,6 +206,9 @@ router.put('/:id/board', async (req, res) => {
       match.status      = 'completed';
       match.winner      = matchWinner === 'A' ? match.teamA : match.teamB;
       match.winnerModel = matchWinner === 'A' ? match.teamAModel : match.teamBModel;
+    } else {
+      // Reset board timer for the next board
+      match.boardStartedAt = new Date();
     }
 
     await match.save();
