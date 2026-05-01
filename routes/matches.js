@@ -227,7 +227,8 @@ router.post('/advance', async (req, res) => {
       return res.status(400).json({ error: 'No completed matches in this round' });
     }
 
-    const winners = completedMatches
+    // Collect winners in order (rank 1, 2, 3...)
+    const winnerEntries = completedMatches
       .filter(m => m.winner && !m.isBye)
       .map(m => ({
         id:    m.winner,
@@ -235,15 +236,56 @@ router.post('/advance', async (req, res) => {
       }));
 
     completedMatches.filter(m => m.isBye && m.teamA).forEach(m => {
-      winners.push({ id: m.teamA, model: m.teamAModel });
+      winnerEntries.push({ id: m.teamA, model: m.teamAModel });
     });
 
+    // ── Common player conflict detection (Doubles/Mixed only) ──
+    if ((matchType === 'double' || matchType === 'mixed') && winnerEntries.length >= 2) {
+      const populatedWinners = await Promise.all(
+        winnerEntries.map(async (w, idx) => {
+          if (w.model === 'Team') {
+            const team = await Team.findById(w.id).populate('players');
+            return { ...w, rank: idx + 1, players: team?.players || [] };
+          }
+          return { ...w, rank: idx + 1, players: [] };
+        })
+      );
+
+      // Check if any player appears in both rank-1 and rank-2 teams
+      const rank1 = populatedWinners[0];
+      const rank2 = populatedWinners[1];
+
+      if (rank1 && rank2 && rank1.players.length && rank2.players.length) {
+        const rank1Ids = rank1.players.map(p => p._id.toString());
+        const commonPlayers = rank2.players.filter(p => rank1Ids.includes(p._id.toString()));
+
+        if (commonPlayers.length > 0) {
+          // There's a conflict — return conflict info instead of advancing
+          // Admin must resolve by choosing a replacement from rank-3 team
+          const rank3 = populatedWinners[2] || null;
+          const rank3Team = rank3 ? await Team.findById(rank3.id).populate('players') : null;
+
+          return res.status(409).json({
+            conflict: true,
+            message: `Common player conflict detected: ${commonPlayers.map(p => p.name).join(', ')} is in both 1st and 2nd place teams.`,
+            commonPlayers: commonPlayers.map(p => ({ _id: p._id, name: p.name, gender: p.gender })),
+            rank1Team: { id: rank1.id, players: rank1.players },
+            rank2Team: { id: rank2.id, players: rank2.players },
+            rank3Team: rank3Team ? { id: rank3Team._id, players: rank3Team.players } : null,
+            round,
+            matchType,
+          });
+        }
+      }
+    }
+
+    // No conflict — proceed normally
     const nextRound  = round + 1;
     const newMatches = [];
 
-    for (let i = 0; i < winners.length; i += 2) {
-      const a    = winners[i];
-      const b    = winners[i + 1];
+    for (let i = 0; i < winnerEntries.length; i += 2) {
+      const a    = winnerEntries[i];
+      const b    = winnerEntries[i + 1];
       const isBye = !b;
 
       newMatches.push({
@@ -264,6 +306,76 @@ router.post('/advance', async (req, res) => {
 
     await Match.insertMany(newMatches);
     res.json({ message: `Round ${nextRound} created with ${newMatches.length} matches` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST resolve common player conflict ──────────────
+// When rank-1 and rank-2 teams share a player:
+// - Common player stays with rank-1 team
+// - rank-2 team gets a replacement player from rank-3 team
+// Body: { matchType, round, rank2TeamId, removePlayerId, addPlayerId }
+router.post('/resolve-conflict', async (req, res) => {
+  try {
+    const { matchType, round, rank2TeamId, removePlayerId, addPlayerId } = req.body;
+
+    if (!rank2TeamId || !removePlayerId || !addPlayerId) {
+      return res.status(400).json({ error: 'rank2TeamId, removePlayerId, addPlayerId are required' });
+    }
+
+    // Remove common player from rank-2 team, add replacement
+    await Team.findByIdAndUpdate(rank2TeamId, {
+      $pull: { players: removePlayerId },
+    });
+    await Team.findByIdAndUpdate(rank2TeamId, {
+      $push: { players: addPlayerId },
+    });
+
+    // Now advance winners normally
+    const completedMatches = await Match.find({ matchType, round, status: 'completed' });
+    const winnerEntries = completedMatches
+      .filter(m => m.winner && !m.isBye)
+      .map(m => ({
+        id:    m.winner,
+        model: m.winner.equals(m.teamA) ? m.teamAModel : m.teamBModel,
+      }));
+
+    completedMatches.filter(m => m.isBye && m.teamA).forEach(m => {
+      winnerEntries.push({ id: m.teamA, model: m.teamAModel });
+    });
+
+    const nextRound  = round + 1;
+    const newMatches = [];
+
+    for (let i = 0; i < winnerEntries.length; i += 2) {
+      const a    = winnerEntries[i];
+      const b    = winnerEntries[i + 1];
+      const isBye = !b;
+
+      newMatches.push({
+        matchType,
+        genderGroup:     completedMatches[0].genderGroup,
+        round:           nextRound,
+        bracketPosition: Math.floor(i / 2),
+        teamA:      a.id,
+        teamAModel: a.model,
+        teamB:      isBye ? null : b.id,
+        teamBModel: isBye ? null : b.model,
+        isBye,
+        status:      isBye ? 'completed' : 'upcoming',
+        winner:      isBye ? a.id : null,
+        winnerModel: isBye ? a.model : null,
+      });
+    }
+
+    await Match.insertMany(newMatches);
+
+    const updatedTeam = await Team.findById(rank2TeamId).populate('players');
+    res.json({
+      message: `Conflict resolved. Round ${nextRound} created with ${newMatches.length} matches.`,
+      updatedTeam,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
